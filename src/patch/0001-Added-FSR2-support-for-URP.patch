@@ -1,0 +1,755 @@
+From 536b2ae86ee036324a581e8e062ed4c94b6df9ef Mon Sep 17 00:00:00 2001
+From: Francis Sun <jianguo.sun@amd.com>
+Date: Fri, 10 Mar 2023 15:15:52 +0800
+Subject: [PATCH] Added FSR2 support for URP
+
+---
+ .../Runtime/AMD/FSR2Feature.cs                |  38 +++
+ .../AMD/FSR2GenerateReactiveMaskPass.cs       |  20 ++
+ .../Runtime/AMD/FSR2Pass.cs                   | 294 ++++++++++++++++++
+ .../Runtime/AMD/FSR2PassControl.cs            | 125 ++++++++
+ .../Data/UniversalRenderPipelineAsset.cs      |   4 +-
+ .../Decal/DBuffer/DBufferRenderPass.cs        |   2 +-
+ .../Runtime/MotionVectorRendering.cs          |   9 +-
+ .../Runtime/Passes/MotionVectorRenderPass.cs  |   3 +
+ .../Runtime/Passes/PostProcessPass.cs         |  26 +-
+ .../Runtime/UniversalRenderPipeline.cs        |  12 +-
+ .../Runtime/UniversalRenderPipelineCore.cs    |   9 +-
+ .../ShaderLibrary/SurfaceInput.hlsl           |   4 +
+ 12 files changed, 532 insertions(+), 14 deletions(-)
+ create mode 100644 Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2Feature.cs
+ create mode 100644 Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2GenerateReactiveMaskPass.cs
+ create mode 100644 Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2Pass.cs
+ create mode 100644 Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2PassControl.cs
+
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2Feature.cs b/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2Feature.cs
+new file mode 100644
+index 0000000000..ca3690c00d
+--- /dev/null
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2Feature.cs
+@@ -0,0 +1,38 @@
++using System.Collections;
++using System.Collections.Generic;
++using UnityEngine;
++using UnityEngine.Rendering.Universal;
++
++public class FSR2Feature : ScriptableRendererFeature
++{
++    FSR2Pass fsr2Pass;
++    FSR2GenerateReactiveMaskPass fsr2GenReactiveMaskPass;
++    public static bool IsSupported()
++    {
++        return SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.Direct3D11;
++    }
++
++    public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
++    {
++        ref var camera_data = ref renderingData.cameraData;
++        var camera = renderingData.cameraData.camera;
++        var fsr2PassControl = camera.GetComponent<FSR2PassControl>();
++        if (fsr2PassControl != null)
++        {
++            fsr2Pass.Setup(fsr2PassControl, ref renderingData);
++            renderer.EnqueuePass(fsr2Pass);
++            if (fsr2PassControl.reactiveMaskParameter.OutputReactiveMask)
++                renderer.EnqueuePass(fsr2GenReactiveMaskPass);
++        }
++    }
++
++    public override void Create()
++    {
++        fsr2Pass = new FSR2Pass
++        {
++            renderPassEvent = RenderPassEvent.AfterRenderingPostProcessing
++        };
++
++        fsr2GenReactiveMaskPass = new FSR2GenerateReactiveMaskPass { FSR2Pass = fsr2Pass, renderPassEvent = RenderPassEvent.BeforeRenderingPostProcessing };
++    }
++}
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2GenerateReactiveMaskPass.cs b/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2GenerateReactiveMaskPass.cs
+new file mode 100644
+index 0000000000..c56560aaa1
+--- /dev/null
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2GenerateReactiveMaskPass.cs
+@@ -0,0 +1,20 @@
++using System.Collections;
++using System.Collections.Generic;
++using UnityEngine;
++using UnityEngine.Rendering;
++using UnityEngine.Rendering.Universal;
++using System.Runtime.InteropServices;
++using System;
++
++public class FSR2GenerateReactiveMaskPass : ScriptableRenderPass
++{
++    public FSR2GenerateReactiveMaskPass()
++    {
++    }
++    private FSR2Pass fsr2Pass;
++    public FSR2Pass FSR2Pass { set { fsr2Pass = value; } }
++    public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
++    {
++        fsr2Pass.ExecuteForReactiveMask(context, ref renderingData);
++    }
++}
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2Pass.cs b/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2Pass.cs
+new file mode 100644
+index 0000000000..dee9d01c22
+--- /dev/null
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2Pass.cs
+@@ -0,0 +1,294 @@
++using System.Collections;
++using System.Collections.Generic;
++using UnityEngine;
++using UnityEngine.Rendering;
++using UnityEngine.Rendering.Universal;
++using System.Runtime.InteropServices;
++using System;
++using UnityEngine.XR;
++
++public class FSR2Pass : ScriptableRenderPass
++{
++    public struct FSR2InitParam
++    {
++        [System.Flags]
++        public enum FlagBits
++        {
++            FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE = (1 << 0),
++            FFX_FSR2_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS = (1 << 1),
++            FFX_FSR2_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION = (1 << 2),
++            FFX_FSR2_ENABLE_DEPTH_INVERTED = (1 << 3),
++            FFX_FSR2_ENABLE_DEPTH_INFINITE = (1 << 4),
++            FFX_FSR2_ENABLE_AUTO_EXPOSURE = (1 << 5),
++            FFX_FSR2_ENABLE_DYNAMIC_RESOLUTION = (1 << 6),
++            FFX_FSR2_ENABLE_TEXTURE1D_USAGE = (1 << 7)
++        }
++        public UInt32 flags;
++        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
++        public UInt32[] displaySize;
++    }
++    private FSR2InitParam initParam = new()
++    {
++        flags = 0,
++        displaySize = new UInt32[2] { 0, 0 }
++    };
++    public struct FSR2GenReactiveParam
++    {
++        [System.Flags]
++        public enum FlagBits
++        {
++            FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_TONEMAP = (1 << 0),
++            FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_INVERSETONEMAP = (1 << 1),
++            FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_THRESHOLD = (1 << 2),
++            FFX_FSR2_AUTOREACTIVEFLAGS_USE_COMPONENTS_MAX = (1 << 3)
++        }
++        public IntPtr colorOpaqueOnly;
++        public IntPtr colorPreUpscale;
++        public IntPtr outReactive;
++        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
++        public UInt32[] renderSize;
++        public float scale;
++        public float cutoffThreshold;
++        public float binaryValue;
++        public UInt32 flags;
++    }
++    private struct FSR2ExecuteParam
++    {
++        public IntPtr color;
++        public IntPtr depth;
++        public IntPtr motionVectors;
++        public IntPtr reactive;
++        public IntPtr transparencyAndComposition;
++        public IntPtr output;
++        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
++        public float[] motionVectorScale;
++        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2)]
++        public UInt32[] renderSize;
++        [MarshalAs(UnmanagedType.I1)]
++        public bool enableSharpening;
++        public float sharpness;
++        public float frameTimeDeltaInSec;
++        public float cameraNear;
++        public float cameraFar;
++        public float cameraFOV;
++    }
++
++#if UNITY_EDITOR
++    const String fsr2UnityPluginName = "fsr2-unity-plugind";
++#else
++    const String fsr2UnityPluginName = "fsr2-unity-plugin";
++#endif
++
++    [DllImport(fsr2UnityPluginName)]
++    static extern void FSR2Initialize(FSR2InitParam p_init_param);
++
++    [DllImport(fsr2UnityPluginName)]
++    static extern void FSR2GetProjectionMatrixJitterOffset(UInt32 render_width, UInt32 render_height, UInt32 display_width, [MarshalAs(UnmanagedType.LPArray, SizeConst = 2)] float[] jitter_offset);
++
++    [DllImport(fsr2UnityPluginName)]
++    static extern void FSR2GenReactiveMask(FSR2GenReactiveParam gen_reactive_param);
++
++    [DllImport(fsr2UnityPluginName)]
++    static extern void FSR2Execute(FSR2ExecuteParam exe_param);
++
++    public string texColorName = "_CameraColorTexture";
++    public string texDepthName = "_CameraDepthTexture";
++    public string texMotionVectors = "_MotionVectorTexture";
++    public string texOpaque = "_CameraOpaqueTexture";
++
++    private int texColorID;
++    private int texDepthID;
++    private int texMotionVectorsID;
++    private int texOpaqueID;
++
++    private FSR2PassControl fsr2PassControl;
++
++    public FSR2Pass()
++    {
++        texColorID = Shader.PropertyToID(texColorName);
++        texDepthID = Shader.PropertyToID(texDepthName);
++        texMotionVectorsID = Shader.PropertyToID(texMotionVectors);
++        texOpaqueID = Shader.PropertyToID(texOpaque);
++
++    }
++    public override void Configure(CommandBuffer cmd, RenderTextureDescriptor cameraTextureDescriptor)
++    {
++        ConfigureInput(ScriptableRenderPassInput.Motion | ScriptableRenderPassInput.Color | ScriptableRenderPassInput.Depth);
++    }
++
++    private RenderTexture texFSR2Output;
++
++    private void CreateUAVRes(int width, int height, RenderTextureFormat rtFormat, bool isRGB, ref RenderTexture outTex)
++    {
++        if (outTex != null) { outTex.Release(); }
++        outTex = RenderTexture.GetTemporary(new RenderTextureDescriptor(width, height, rtFormat) { sRGB = isRGB, enableRandomWrite = true });
++        outTex.Create();
++    }
++
++    bool displaySizeChanged = true;
++    bool initialized = false;
++    public void Initialize(ref RenderingData renderingData)
++    {
++        ref var cameraData = ref renderingData.cameraData;
++        var camera = cameraData.camera;
++        var display_size = initParam.displaySize;
++        if (display_size[0] != camera.pixelWidth || display_size[1] != camera.pixelHeight)
++        {
++            displaySizeChanged = true;
++            display_size[0] = (UInt32)camera.pixelWidth;
++            display_size[1] = (UInt32)camera.pixelHeight;
++            initParam.flags = (UInt32)(
++                FSR2InitParam.FlagBits.FFX_FSR2_ENABLE_AUTO_EXPOSURE
++                | FSR2InitParam.FlagBits.FFX_FSR2_ENABLE_DEPTH_INVERTED
++                );
++            if (cameraData.isHdrEnabled)
++                initParam.flags |= (UInt32)FSR2InitParam.FlagBits.FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE;
++            FSR2Initialize(initParam);
++        }
++        initialized = true;
++    }
++
++    private RenderTexture texReactiveOut;
++    private int[] lastRenderSize = new int[2] { 0, 0 };
++    public void ExecuteForReactiveMask(ScriptableRenderContext context, ref RenderingData renderingData)
++    {
++        if (fsr2PassControl.FSR2Quality != FSR2Mode.Disabled)
++        {
++            CommandBuffer cmd = CommandBufferPool.Get();
++
++            cmd.SetRenderTarget(RenderTargetHandle.CameraTarget.id);
++            context.ExecuteCommandBuffer(cmd);
++            context.Submit();
++            cmd.Release();
++
++            var reactiveMaskParam = fsr2PassControl.reactiveMaskParameter;
++            if (reactiveMaskParam.OutputReactiveMask)
++            {
++                Initialize(ref renderingData);
++                ref var cameraData = ref renderingData.cameraData;
++                var camera = cameraData.camera;
++
++                var texOpaque = Shader.GetGlobalTexture(texOpaqueID);
++                var texColor = Shader.GetGlobalTexture(texColorID);
++                if (texColor == null || texOpaque == null)
++                    return;
++
++                // create uav for reactive
++                int renderSizeWidth = (int)(camera.pixelWidth * cameraData.renderScale);
++                int renderSizeHeight = (int)(camera.pixelHeight * cameraData.renderScale);
++                if (lastRenderSize[0] != renderSizeWidth || lastRenderSize[1] != renderSizeHeight)
++                {
++                    CreateUAVRes(renderSizeWidth, renderSizeHeight, RenderTextureFormat.R8, false, ref texReactiveOut);
++                    lastRenderSize[0] = renderSizeWidth;
++                    lastRenderSize[1] = renderSizeHeight;
++                }
++
++                // gen reactive mask
++                FSR2GenReactiveMask(new FSR2GenReactiveParam()
++                {
++                    colorOpaqueOnly = texOpaque.GetNativeTexturePtr(),
++                    colorPreUpscale = texColor.GetNativeTexturePtr(),
++                    outReactive = texReactiveOut.GetNativeTexturePtr(),
++                    renderSize = new UInt32[2] { (UInt32)renderSizeWidth, (UInt32)renderSizeHeight },
++                    scale = reactiveMaskParam.ReactiveMaskScale,
++                    cutoffThreshold = 1.0f,
++                    binaryValue = 1.0f,
++                    flags = (UInt32)reactiveMaskParam.ReactiveMaskFlags
++                });
++
++            }
++        }
++    }
++
++    public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
++    {
++        if (fsr2PassControl.FSR2Quality != FSR2Mode.Disabled)
++        {
++            CommandBuffer cmd = CommandBufferPool.Get();
++
++            // texColor could still be used as render target, which will cause set resource failed later 
++            cmd.SetRenderTarget(RenderTargetHandle.CameraTarget.id);
++            context.ExecuteCommandBuffer(cmd);
++            context.Submit();
++            cmd.Release();
++
++            if (!initialized)
++            {
++                Initialize(ref renderingData);
++            }
++            initialized = false;
++
++            var texColor = Shader.GetGlobalTexture(texColorID) as RenderTexture;
++            ref var cameraData = ref renderingData.cameraData;
++            var camera = cameraData.camera;
++            if (displaySizeChanged)
++            {
++                CreateUAVRes(camera.pixelWidth, camera.pixelHeight, RenderTextureFormat.ARGB32, texColor.sRGB, ref texFSR2Output);
++                displaySizeChanged = false;
++            }
++            var texDepth = Shader.GetGlobalTexture(texDepthID);
++            var texMV = Shader.GetGlobalTexture(texMotionVectorsID);
++            var texOpaque = Shader.GetGlobalTexture(texOpaqueID);
++            if (texColor == null || texDepth == null || texMV == null || texOpaque == null)
++                return;
++
++            int renderSizeWidth = (int)(camera.pixelWidth * cameraData.renderScale);
++            int renderSizeHeight = (int)(camera.pixelHeight * cameraData.renderScale);
++            RenderTexture reactive, transparencyAndComposition;
++            var reactiveMaskParam = fsr2PassControl.reactiveMaskParameter;
++            if (reactiveMaskParam.OutputReactiveMask)
++            {
++                reactive = texReactiveOut;
++                transparencyAndComposition = null;
++            }
++            else
++            {
++
++                reactive = reactiveMaskParam.OptReactiveMaskTex;
++                transparencyAndComposition = reactiveMaskParam.OptTransparencyAndCompositionTex;
++            }
++            FSR2Execute(new FSR2ExecuteParam()
++            {
++                color = texColor.GetNativeTexturePtr(),
++                depth = texDepth.GetNativeTexturePtr(),
++                motionVectors = texMV.GetNativeTexturePtr(),
++                reactive = reactive ? reactive.GetNativeTexturePtr() : IntPtr.Zero,
++                transparencyAndComposition = transparencyAndComposition ? transparencyAndComposition.GetNativeTexturePtr() : IntPtr.Zero,
++                output = texFSR2Output.GetNativeTexturePtr(),
++                motionVectorScale = new float[2] { -1 * renderSizeWidth, 1 * renderSizeHeight },
++                renderSize = new UInt32[2] { (UInt32)renderSizeWidth, (UInt32)renderSizeHeight },
++                enableSharpening = fsr2PassControl.EnableSharpening,
++                sharpness = fsr2PassControl.Sharpness,
++                frameTimeDeltaInSec = Time.deltaTime,
++                cameraNear = camera.nearClipPlane,
++                cameraFar = camera.farClipPlane,
++                cameraFOV = camera.fieldOfView * Mathf.Deg2Rad
++            });
++            renderingData.cameraData.fsr2Output = texFSR2Output;
++        }
++        else
++        {
++            renderingData.cameraData.fsr2Output = null;
++        }
++    }
++
++    Matrix4x4 jitterMat = Matrix4x4.identity;
++    private float[] jitterOffset = new float[2];
++    public void Setup(FSR2PassControl newFSR2PassControl, ref RenderingData renderingData)
++    {
++        fsr2PassControl = newFSR2PassControl;
++        ref var cameraData = ref renderingData.cameraData;
++        if (fsr2PassControl.FSR2Quality != FSR2Mode.Disabled)
++        {
++            var camera = cameraData.camera;
++            uint render_size_width = (uint)(cameraData.camera.pixelWidth * cameraData.renderScale);
++            uint render_size_height = (uint)(camera.pixelHeight * cameraData.renderScale);
++            FSR2GetProjectionMatrixJitterOffset(render_size_width, render_size_height, (UInt32)camera.pixelWidth, jitterOffset);
++            jitterMat.m03 = jitterOffset[0];
++            jitterMat.m13 = -jitterOffset[1];
++            cameraData.jitterMatrix = jitterMat;
++        }
++        else
++            cameraData.jitterMatrix = Matrix4x4.identity;
++    }
++}
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2PassControl.cs b/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2PassControl.cs
+new file mode 100644
+index 0000000000..1f0c739852
+--- /dev/null
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/AMD/FSR2PassControl.cs
+@@ -0,0 +1,125 @@
++using System.Collections;
++using System.Collections.Generic;
++using UnityEngine;
++using UnityEngine.Rendering;
++using System.Runtime.InteropServices;
++using System;
++using UnityEngine.Rendering.Universal;
++using System.Runtime.InteropServices.WindowsRuntime;
++
++public enum FSR2Mode
++{
++    Disabled = 0,
++    Quality,
++    Balanced,
++    Performance,
++    UltraPerformance,
++    [InspectorName(null)]
++    Max
++}
++public class FSR2PassControl : MonoBehaviour
++{
++    struct ModeData
++    {
++        public float renderScale;
++        public float mipmapBias;
++    }
++    readonly ModeData[] modeData = new ModeData[(int)FSR2Mode.Max]
++    {
++        new(){renderScale = 1.0f, mipmapBias = 0.0f},
++        new(){renderScale = 1.0f / 1.5f, mipmapBias = -1.58f},
++        new(){renderScale = 1.0f / 1.7f, mipmapBias = -1.76f},
++        new(){renderScale = 1.0f / 2.0f, mipmapBias= -2.0f},
++        new(){renderScale = 1.0f / 3.0f , mipmapBias = -2.58f}
++    };
++
++    public FSR2Mode FSR2Quality = FSR2Mode.Disabled;
++
++    [HideInInspector]
++    public FSR2Pass.FSR2InitParam.FlagBits FSR2ContextFlags;
++
++    [Header("Sharpening")]
++    public bool EnableSharpening = true;
++    [Range(0f, 1f)]
++    public float Sharpness = .3f;
++
++    [System.Serializable]
++    public class ReactiveMaskParameter
++    {
++        public bool OutputReactiveMask = false;
++        [Range(0.0f, 1.0f)]
++        public float ReactiveMaskScale = .3f;
++        [Range(0.0f, 1.0f)]
++        public float CutoffThreshold = .3f;
++        [Range(0.0f, 1.0f)]
++        public float BinaryValue = .3f;
++        public FSR2Pass.FSR2GenReactiveParam.FlagBits ReactiveMaskFlags;
++        [HideInInspector]
++        public RenderTexture OptReactiveMaskTex;
++        [HideInInspector]
++        public RenderTexture OptTransparencyAndCompositionTex;
++    };
++    public ReactiveMaskParameter reactiveMaskParameter;
++
++    UniversalRenderPipelineAsset urpAsset;
++
++    new Camera camera;
++
++    bool originPostProcessingEnabled = false;
++    bool originMSAAEnabled = false;
++    AntialiasingMode originAAMode = AntialiasingMode.None;
++    UniversalAdditionalCameraData uaCameraData = null;
++    void Start()
++    {
++        urpAsset = GraphicsSettings.currentRenderPipeline as UniversalRenderPipelineAsset;
++        if (urpAsset == null)
++            Debug.LogError("no UniversalRenderPipelineAsset used in current pipeline");
++
++        camera = GetComponent<Camera>();
++        if (camera == null)
++            Debug.LogError("No Camera component found in this GameObject");
++        uaCameraData = camera.GetUniversalAdditionalCameraData();
++        if (uaCameraData == null)
++            Debug.LogError("No UniversalAdditionalCameraData found");
++        originPostProcessingEnabled = uaCameraData.renderPostProcessing;
++        originMSAAEnabled = camera.allowMSAA;
++        originAAMode = uaCameraData.antialiasing;
++
++        if (!FSR2Feature.IsSupported())
++        {
++            Debug.LogError("FSR2 is not supported on current platform");
++            FSR2Quality = FSR2Mode.Disabled;
++            this.enabled = false;
++        }
++    }
++
++    FSR2Mode lastFSR2Mode = FSR2Mode.Max;
++
++    void Update()
++    {
++        if (lastFSR2Mode != FSR2Quality)
++        {
++            if (FSR2Quality >= FSR2Mode.Disabled && FSR2Quality <= FSR2Mode.UltraPerformance)
++            {
++                ref var current_mode_data = ref modeData[(int)FSR2Quality];
++                if (FSR2Quality != FSR2Mode.Disabled)
++                {
++                    Shader.EnableKeyword("_AMD_FSR2");
++                    uaCameraData.renderPostProcessing = true;
++                    camera.allowMSAA = false;
++                    uaCameraData.antialiasing = AntialiasingMode.None;
++                }
++                else
++                {
++                    Shader.EnableKeyword("_AMD_FSR2");
++                    uaCameraData.renderPostProcessing = originPostProcessingEnabled;
++                    camera.allowMSAA = originMSAAEnabled;
++                    uaCameraData.antialiasing = originAAMode;
++                }
++                urpAsset.renderScale = current_mode_data.renderScale;
++                Shader.SetGlobalFloat("amd_fsr2_mipmap_bias", current_mode_data.mipmapBias);
++                lastFSR2Mode = FSR2Quality;
++            }
++        }
++    }
++}
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/Data/UniversalRenderPipelineAsset.cs b/Packages/com.unity.render-pipelines.universal/Runtime/Data/UniversalRenderPipelineAsset.cs
+index 66cd3a73ef..a463917731 100644
+--- a/Packages/com.unity.render-pipelines.universal/Runtime/Data/UniversalRenderPipelineAsset.cs
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/Data/UniversalRenderPipelineAsset.cs
+@@ -149,7 +149,9 @@ namespace UnityEngine.Rendering.Universal
+         [InspectorName("Nearest-Neighbor")]
+         Point,
+         [InspectorName("FidelityFX Super Resolution 1.0")]
+-        FSR
++        FSR,
++        [InspectorName("FidelityFX Super Resolution 2.0")]
++        FSR2
+     }
+ 
+     [ExcludeFromPreset]
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/Decal/DBuffer/DBufferRenderPass.cs b/Packages/com.unity.render-pipelines.universal/Runtime/Decal/DBuffer/DBufferRenderPass.cs
+index 1f7e3d0e02..7d33819cc5 100644
+--- a/Packages/com.unity.render-pipelines.universal/Runtime/Decal/DBuffer/DBufferRenderPass.cs
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/Decal/DBuffer/DBufferRenderPass.cs
+@@ -161,7 +161,7 @@ namespace UnityEngine.Rendering.Universal
+             {
+                 cmd.SetViewProjectionMatrices(Matrix4x4.identity, Matrix4x4.identity); // Prepare for manual blit
+                 cmd.DrawMesh(RenderingUtils.fullscreenMesh, Matrix4x4.identity, m_DBufferClear, 0, 0);
+-                cmd.SetViewProjectionMatrices(cameraData.camera.worldToCameraMatrix, cameraData.camera.projectionMatrix);
++                cmd.SetViewProjectionMatrices(cameraData.camera.worldToCameraMatrix, cameraData.GetProjectionMatrix());
+             }
+ 
+             cmd.EndSample(clearSampleName);
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/MotionVectorRendering.cs b/Packages/com.unity.render-pipelines.universal/Runtime/MotionVectorRendering.cs
+index d23a77bb58..a246b9ae32 100644
+--- a/Packages/com.unity.render-pipelines.universal/Runtime/MotionVectorRendering.cs
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/MotionVectorRendering.cs
+@@ -96,6 +96,7 @@ namespace UnityEngine.Rendering.Universal.Internal
+             // (different Z value ranges etc.)
+ 
+             // A camera could be rendered multiple times per frame, only updates the previous view proj & pos if needed
++            cameraData.jitterMatrix = Matrix4x4.identity;
+ #if ENABLE_VR && ENABLE_XR_MODULE
+             if (cameraData.xr.enabled)
+             {
+@@ -120,17 +121,21 @@ namespace UnityEngine.Rendering.Universal.Internal
+             else
+ #endif
+             {
+-                var gpuProj = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true); // Had to change this from 'false'
++                var gpuProj = GL.GetGPUProjectionMatrix(cameraData.GetProjectionMatrix() , true); // Had to change this from 'false'
+                 var gpuView = camera.worldToCameraMatrix;
+                 var gpuVP = gpuProj * gpuView;
+ 
+                 // Last frame data
+                 if (motionData.lastFrameActive != Time.frameCount)
+                 {
+-                    motionData.previousViewProjectionMatrix = motionData.isFirstFrame ? gpuVP : motionData.viewProjectionMatrix;
+                     motionData.isFirstFrame = false;
+                 }
+ 
++                // FSR2 maintain a history jitter offset internally, if we pass jitter index(frameCount) as last time, the previous jitter offset will be still updated
++                // hence next time when the index is still the same, there will be a zero jitter cancellation, which will make jitter cancellation failed
++                // in order to match with this behaviour in FSR2, move the previous vpMat update outside of if statement
++                motionData.previousViewProjectionMatrix = motionData.isFirstFrame ? gpuVP : motionData.viewProjectionMatrix;
++
+                 // Current frame data
+                 motionData.viewProjectionMatrix = gpuVP;
+             }
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/Passes/MotionVectorRenderPass.cs b/Packages/com.unity.render-pipelines.universal/Runtime/Passes/MotionVectorRenderPass.cs
+index 01c522322e..090e1356b8 100644
+--- a/Packages/com.unity.render-pipelines.universal/Runtime/Passes/MotionVectorRenderPass.cs
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/Passes/MotionVectorRenderPass.cs
+@@ -88,8 +88,11 @@ namespace UnityEngine.Rendering.Universal.Internal
+                 camera.depthTextureMode |= DepthTextureMode.MotionVectors | DepthTextureMode.Depth;
+ 
+                 // TODO: add option to only draw either one?
++                cameraData.jitterMatrix = Matrix4x4.identity;
++                cmd.SetViewProjectionMatrices(cameraData.GetViewMatrix(), cameraData.GetProjectionMatrix());
+                 DrawCameraMotionVectors(context, cmd, camera);
+                 DrawObjectMotionVectors(context, ref renderingData, camera);
++                cmd.SetViewProjectionMatrices(renderingData.cameraData.GetViewMatrix(), renderingData.cameraData.GetProjectionMatrix());
+             }
+             ExecuteCommand(context, cmd);
+             CommandBufferPool.Release(cmd);
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/Passes/PostProcessPass.cs b/Packages/com.unity.render-pipelines.universal/Runtime/Passes/PostProcessPass.cs
+index 07e2633899..35c3120627 100644
+--- a/Packages/com.unity.render-pipelines.universal/Runtime/Passes/PostProcessPass.cs
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/Passes/PostProcessPass.cs
+@@ -144,6 +144,11 @@ namespace UnityEngine.Rendering.Universal.Internal
+ 
+         public void Cleanup() => m_Materials.Cleanup();
+ 
++        public override void Configure(CommandBuffer cmd, RenderTextureDescriptor cameraTextureDescriptor)
++        {
++            ConfigureInput(ScriptableRenderPassInput.Motion | ScriptableRenderPassInput.Color | ScriptableRenderPassInput.Depth);
++        }
++
+         public void Setup(in RenderTextureDescriptor baseDescriptor, in RenderTargetHandle source, bool resolveToScreen, in RenderTargetHandle depth, in RenderTargetHandle internalLut, bool hasFinalPass, bool enableSRGBConversion, bool hasExternalPostPasses)
+         {
+             m_Descriptor = baseDescriptor;
+@@ -465,14 +470,16 @@ namespace UnityEngine.Rendering.Universal.Internal
+ 
+             // Panini projection is done as a fullscreen pass after all depth-based effects are done
+             // and before bloom kicks in
+-            if (usePaniniProjection)
+-            {
+-                using (new ProfilingScope(cmd, ProfilingSampler.Get(URPProfileId.PaniniProjection)))
++            // the panini projection can not be used with FSR2 in the same camera, try to use multi-cameras and apply this effect in a different camera
++            if (cameraData.upscalingFilter != ImageUpscalingFilter.FSR2)
++                if (usePaniniProjection)
+                 {
+-                    DoPaniniProjection(cameraData.camera, cmd, GetSource(), GetDestination());
+-                    Swap(ref renderer);
++                    using (new ProfilingScope(cmd, ProfilingSampler.Get(URPProfileId.PaniniProjection)))
++                    {
++                        DoPaniniProjection(cameraData.camera, cmd, GetSource(), GetDestination());
++                        Swap(ref renderer);
++                    }
+                 }
+-            }
+ 
+             // Lens Flare
+             if (useLensFlare)
+@@ -1517,6 +1524,13 @@ namespace UnityEngine.Rendering.Universal.Internal
+ 
+                                 break;
+                             }
++
++                            case ImageUpscalingFilter.FSR2:
++                            {
++                                if (cameraData.fsr2Output != null)
++                                    cmd.SetGlobalTexture(ShaderPropertyId.sourceTex, cameraData.fsr2Output);
++                                break;
++                            }
+                         }
+ 
+                         break;
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/UniversalRenderPipeline.cs b/Packages/com.unity.render-pipelines.universal/Runtime/UniversalRenderPipeline.cs
+index 1f73d38de3..74a47d6281 100644
+--- a/Packages/com.unity.render-pipelines.universal/Runtime/UniversalRenderPipeline.cs
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/UniversalRenderPipeline.cs
+@@ -734,6 +734,7 @@ namespace UnityEngine.Rendering.Universal
+             using var profScope = new ProfilingScope(null, Profiling.Pipeline.initializeCameraData);
+ 
+             cameraData = new CameraData();
++            cameraData.jitterMatrix = Matrix4x4.identity;
+             InitializeStackedCameraData(camera, additionalCameraData, ref cameraData);
+             InitializeAdditionalCameraData(camera, additionalCameraData, resolveFinalTarget, ref cameraData);
+ 
+@@ -841,7 +842,7 @@ namespace UnityEngine.Rendering.Universal
+             {
+                 cameraData.imageScalingMode = ImageScalingMode.Downscaling;
+             }
+-            else if ((cameraData.renderScale < 1.0f) || (cameraData.upscalingFilter == ImageUpscalingFilter.FSR))
++            else if ((cameraData.renderScale < 1.0f) || (cameraData.upscalingFilter == ImageUpscalingFilter.FSR) || (cameraData.upscalingFilter == ImageUpscalingFilter.FSR2))
+             {
+                 // When FSR is enabled, we still consider 100% render scale an upscaling operation.
+                 // This allows us to run the FSR shader passes all the time since they improve visual quality even at 100% scale.
+@@ -1290,7 +1291,8 @@ namespace UnityEngine.Rendering.Universal
+             ImageUpscalingFilter filter = ImageUpscalingFilter.Linear;
+ 
+             // Fall back to the automatic filter if FSR was selected, but isn't supported on the current platform
+-            if ((selection == UpscalingFilterSelection.FSR) && !FSRUtils.IsSupported())
++            if (((selection == UpscalingFilterSelection.FSR) && !FSRUtils.IsSupported()) ||
++                ((selection == UpscalingFilterSelection.FSR2) && SystemInfo.graphicsDeviceType != GraphicsDeviceType.Direct3D11))
+             {
+                 selection = UpscalingFilterSelection.Auto;
+             }
+@@ -1340,6 +1342,12 @@ namespace UnityEngine.Rendering.Universal
+                 {
+                     filter = ImageUpscalingFilter.FSR;
+ 
++                    break;
++                }
++                case UpscalingFilterSelection.FSR2:
++                {
++                    filter = ImageUpscalingFilter.FSR2;
++
+                     break;
+                 }
+             }
+diff --git a/Packages/com.unity.render-pipelines.universal/Runtime/UniversalRenderPipelineCore.cs b/Packages/com.unity.render-pipelines.universal/Runtime/UniversalRenderPipelineCore.cs
+index a08a2cb1a9..7fa53bac9e 100644
+--- a/Packages/com.unity.render-pipelines.universal/Runtime/UniversalRenderPipelineCore.cs
++++ b/Packages/com.unity.render-pipelines.universal/Runtime/UniversalRenderPipelineCore.cs
+@@ -42,7 +42,9 @@ namespace UnityEngine.Rendering.Universal
+         Point,
+ 
+         /// FidelityFX Super Resolution
+-        FSR
++        FSR,
++
++        FSR2
+     }
+ 
+     public struct RenderingData
+@@ -116,7 +118,7 @@ namespace UnityEngine.Rendering.Universal
+             if (xr.enabled)
+                 return xr.GetProjMatrix(viewIndex);
+ #endif
+-            return m_ProjectionMatrix;
++            return jitterMatrix * m_ProjectionMatrix;
+         }
+ 
+         /// <summary>
+@@ -246,6 +248,9 @@ namespace UnityEngine.Rendering.Universal
+         /// Camera position in world space.
+         /// </summary>
+         public Vector3 worldSpaceCameraPos;
++
++        public RenderTexture fsr2Output;
++        public Matrix4x4 jitterMatrix;
+     }
+ 
+     public struct ShadowData
+diff --git a/Packages/com.unity.render-pipelines.universal/ShaderLibrary/SurfaceInput.hlsl b/Packages/com.unity.render-pipelines.universal/ShaderLibrary/SurfaceInput.hlsl
+index 107301077b..f31a81c427 100644
+--- a/Packages/com.unity.render-pipelines.universal/ShaderLibrary/SurfaceInput.hlsl
++++ b/Packages/com.unity.render-pipelines.universal/ShaderLibrary/SurfaceInput.hlsl
+@@ -35,7 +35,11 @@ half Alpha(half albedoAlpha, half4 color, half cutoff)
+ 
+ half4 SampleAlbedoAlpha(float2 uv, TEXTURE2D_PARAM(albedoAlphaMap, sampler_albedoAlphaMap))
+ {
++#ifdef _AMD_FSR2
++    return half4(SAMPLE_TEXTURE2D(albedoAlphaMap, sampler_albedoAlphaMap, uv, amd_fsr2_mipmap_bias));
++#else
+     return half4(SAMPLE_TEXTURE2D(albedoAlphaMap, sampler_albedoAlphaMap, uv));
++#endif
+ }
+ 
+ half3 SampleNormal(float2 uv, TEXTURE2D_PARAM(bumpMap, sampler_bumpMap), half scale = half(1.0))
+-- 
+2.37.2.windows.2
+
